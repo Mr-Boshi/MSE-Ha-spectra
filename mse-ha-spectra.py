@@ -46,6 +46,29 @@ def json_to_bsrate(filename, Energy, ne, te):
 						
 		return beamstop_rate
 
+def json_to_emissrate(filename, Energy, ne, te):
+	# E must be in keV
+	# Beamstop rates are in m3/s
+
+	with open(filename, 'r') as json_file:
+		data = json.load(json_file)
+		emission_data = data['3 -> 2']
+
+		s_ne_int = interp2d(emission_data['e'], emission_data['n'], emission_data['sen'], kind='cubic',
+		                    bounds_error=False, fill_value=0.)
+		st = np.array(emission_data['st'])/emission_data['sref']
+		s_t_int = interp1d(emission_data['t'], st, kind='cubic',
+    	                bounds_error=False, fill_value=0.)
+
+		beamstop_rate = np.zeros((len(Energy), len(ne)))
+		for j in range(0, len(Energy)):
+			for i in range(0, len(ne)):
+				beamstop_rate[j, i] = s_ne_int(Energy[j]*1e3, ne[i])*s_t_int(te[i])
+				if beamstop_rate[j,i] <=0.0:
+					beamstop_rate[j,i] = 0.0
+						
+		return beamstop_rate
+
 
 #%% CLASSES
 class plasma_interpolated:
@@ -98,9 +121,11 @@ Neutralization_efficiency = np.array([0.43, 0.7, 0.8],float)
 
 Velocity = e_to_v(Energy) 														# Particles velocities in m/s
 
-I_0  = 6.1																		# Ion current in Amp
-De   = 0.08																		# Beam diameter at 1/e in meters
-D_05 = De/(sqrt(2*sqrt(log(2))))
+I_0   = 6.1																		# Ion current in Amp
+De    = 0.08																	# Beam diameter at 1/e in meters
+D_05  = De/(sqrt(2*sqrt(log(2))))
+diver_deg = 0.6																	# Beam divergence in degrees
+diver_rad = diver_deg*2*pi/360													# Beam divergence in degrees
 
 Beam_cs      = pi*(D_05/2)**2
 j_beam_total = I_0/(Composition[0]*Beam_cs)										# Beam total current density in A/m^2
@@ -135,6 +160,17 @@ if not min(rho_array) == 0:
 
 T15_inter = plasma_interpolated(rho_array, ne_array, ni_array, Te_array, Ti_array)
 
+#%% Fractions of plasma composition species (used for ADAS rates calculation)
+f_c = (ne_array/ni_array - z_p)/(z_c6-z_p)
+f_h = 1-f_c
+
+sum_zf  = z_p * f_h + z_c6 * f_c
+sum_z2f = z_p**2 * f_h + z_c6**2 * f_c
+
+# Equivalent electron density for each plasma specie
+ne_equ_h = (ne_array / sum_zf) * (sum_z2f / z_p)
+ne_equ_c = (ne_array / sum_zf) * (sum_z2f / z_c6)
+
 #%% Beam-stopping calculation
 # Use 'ADAS' to get rates from json or or 'SOS' to use rates stored in file
 source_key='ADAS'
@@ -160,24 +196,8 @@ elif source_key=='ADAS':
 	beamstop_h_json_file = r'beam\stopping\h\h\1_default.json'
 	beamstop_c_json_file = r'beam\stopping\h\c\6_default.json'
 
-	# Fractions of plasma composition species
-	f_c = (ne_array/ni_array - z_p)/(z_c6-z_p)
-	f_h = 1-f_c
-
-	sum_zf  = z_p * f_h + z_c6 * f_c
-	sum_z2f = z_p**2 * f_h + z_c6**2 * f_c
-
-	# Equivalent electron density for each plasma specie
-	ne_equ_h = (ne_array / sum_zf) * (sum_z2f / z_p)
-	ne_equ_c = (ne_array / sum_zf) * (sum_z2f / z_c6)
-
 	bs_rate_h = json_to_bsrate(beamstop_h_json_file, Energy, ne_equ_h, Ti_array)
 	bs_rate_c = json_to_bsrate(beamstop_c_json_file, Energy, ne_equ_c, Ti_array)
-
-
-	bs_rate_1  = np.zeros(bs_rate_c.shape)
-	bs_rate_1 += z_p * bs_rate_h * f_h / sum_zf
-	bs_rate_1 += z_c6 * bs_rate_c * f_c / sum_zf
 
 	bs_rate = (bs_rate_h + bs_rate_c) / sum_zf
 
@@ -187,7 +207,7 @@ elif source_key=='ADAS':
 
 	# Beam-stopping calculation
 
-	rho                 = np.linspace(1, -1, num=100, endpoint=True)
+	rho                 = np.linspace(1, -1, num=200, endpoint=True)
 	rho_dif             = a*abs(np.diff(rho))										# in meters
 	Ne_Sbs              = np.zeros((len(Energy), len(rho)))
 	Ne_Sbs_sum          = np.zeros((len(Energy), len(rho)))
@@ -211,9 +231,40 @@ else:
 dnb_inter = beam_interpolated(rho, N0_array)
 
 # %% MSE H_alpha exitation rates
+h_alpha_h_json_file = r'beam\emission\h\h\1_default.json'
+h_alpha_c_json_file = r'beam\emission\h\c\6_default.json'
+
+h_alpha_rate_h = json_to_emissrate(h_alpha_h_json_file, Energy, ne_equ_h, Ti_array)
+h_alpha_rate_c = json_to_emissrate(h_alpha_c_json_file, Energy, ne_equ_c, Ti_array)
+
+h_alpha_rate = (h_alpha_rate_h + h_alpha_rate_c) / sum_zf
+h_a_rate_inter = beam_interpolated(rho_array, h_alpha_rate)
+
+h_alpha_intens      = np.zeros(((len(Energy), len(rho))))
+h_alpha_intens[0,:] = h_a_rate_inter.e0(rho)*dnb_inter.e0(rho)*T15_inter.ne(rho)
+h_alpha_intens[1,:] = h_a_rate_inter.e02(rho)*dnb_inter.e02(rho)*T15_inter.ne(rho)
+h_alpha_intens[2,:] = h_a_rate_inter.e03(rho)*dnb_inter.e03(rho)*T15_inter.ne(rho)
+h_a_inten_inter     = beam_interpolated(rho, h_alpha_intens)
+
+#%% DNB density profile calculation
+d_array     = np.linspace(-0.1, 0.1, num=200, endpoint=True)
+r_e0         = 0.032
+r_e_array = r_e0+ (np.abs((rho-1)*a))*np.tan(diver_rad/2)
+print(np.tan(diver_rad/2))
+den_profile_array = np.zeros((len(rho), len(d_array)))
+for i in range(0, len(rho)):
+	den_profile = np.exp(-0.5*(d_array/(r_e_array[i]/np.sqrt(2)))**2)
+	den_profile_sum = np.sum(den_profile)
+	den_profile_array[i, :] = den_profile / den_profile_sum
 
 
 
+
+plt.plot(d_array, den_profile_array[0,:], d_array, den_profile_array[40,:], d_array, den_profile_array[80,:], d_array, den_profile_array[120,:], d_array, den_profile_array[160,:], d_array, den_profile_array[-1,:])
+# plt.plot(d_array, den_profile)
+plt.grid(True)
+plt.xlabel('beam diameter')
+plt.show()
 
 # %% Plasma profiles plotting
 
@@ -276,10 +327,38 @@ dnb_inter = beam_interpolated(rho, N0_array)
 
 # %% Beam density plots (From file)
 
+# plt.plot(rho, dnb_inter.e0(rho), '-', rho, dnb_inter.e02(rho), '-', rho, dnb_inter.e03(rho), '-')
+# plt.grid(True)
+# plt.ylabel('Beam density')
+# plt.xlabel('rho')
+# plt.show()
 
-plt.plot(rho, dnb_inter.e0(rho), '-', rho, dnb_inter.e02(rho), '-', rho, dnb_inter.e03(rho), '-')
-plt.grid(True)
-plt.ylabel('Beam density')
-plt.xlabel('rho')
-plt.show()
+#%% H-alpha emission rate
+
+# plt.subplot(3 ,1, 1)
+# plt.plot(rho_array, h_alpha_rate_h[0,:], rho_array, h_alpha_rate_h[1,:], rho_array, h_alpha_rate_h[2,:])
+# plt.grid(True)
+# plt.ylabel('Emission rate')
+# plt.xlabel('rho')
+
+# plt.subplot(3 ,1, 2)
+# plt.plot(rho_array, h_alpha_rate_c[0,:], rho_array, h_alpha_rate_c[1,:], rho_array, h_alpha_rate_c[2,:])
+# plt.grid(True)
+# plt.ylabel('Emission rate')
+# plt.xlabel('rho')
+
+# plt.subplot(3 ,1, 3)
+# plt.plot(rho, h_a_rate_inter.e0(rho), rho, h_a_rate_inter.e02(rho), rho, h_a_rate_inter.e03(rho))
+# plt.grid(True)
+# plt.ylabel('Emission rate')
+# plt.xlabel('rho')
+# plt.show()
+
+#%% H-alpha emission intensity
+
+# plt.plot(rho, h_a_inten_inter.e0(rho), rho, h_a_inten_inter.e02(rho), rho, h_a_inten_inter.e03(rho))
+# plt.grid(True)
+# plt.ylabel('H_alpha emission intensity')
+# plt.xlabel('rho')
+# plt.show()
 
